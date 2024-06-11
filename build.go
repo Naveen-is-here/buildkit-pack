@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/client/llb/sourceresolver"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/pb"
@@ -105,7 +106,7 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	extract.AddMount("/in", build.Root(), llb.SourcePath("out"), llb.Readonly)
 	st := extract.AddMount("/out", llb.Image(runName))
 
-	def, err := st.Marshal(llb.WithCaps(c.BuildOpts().LLBCaps))
+	def, err := st.Marshal(ctx, llb.WithCaps(c.BuildOpts().LLBCaps))
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +127,7 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 
 	var config []byte
 	eg.Go(func() error {
-		_, c, err := c.ResolveImageConfig(ctx, runName, client.ResolveImageConfigOpt{})
+		_, _, c, err := c.ResolveImageConfig(ctx, runName, sourceresolver.Opt{})
 		if err != nil {
 			return err
 		}

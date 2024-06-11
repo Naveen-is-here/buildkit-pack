@@ -15,35 +15,38 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	pack "github.com/tonistiigi/buildkit-pack"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v2" // updated import path
 	"golang.org/x/sync/errgroup"
 )
 
 func main() {
-	app := cli.NewApp()
-	app.Name = "pack-cli"
-	app.UsageText = `pack-cli PATH | URL | -`
-	app.Description = `
+	app := &cli.App{
+		Name:  "pack-cli",
+		Usage: "pack-cli PATH | URL | -",
+		Description: `
 debug utility for invoking pack directly from client.
-`
-	app.Flags = append([]cli.Flag{
-		cli.StringFlag{
-			Name:   "buildkit-addr",
-			Usage:  "buildkit daemon address",
-			EnvVar: "BUILDKIT_HOST",
-			Value:  appdefaults.Address,
+`,
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "buildkit-addr",
+				Usage:   "buildkit daemon address",
+				EnvVars: []string{"BUILDKIT_HOST"},
+				Value:   appdefaults.Address,
+			},
+			&cli.StringFlag{
+				Name:  "progress",
+				Usage: "Set type of progress (auto, plain, tty). Use plain to show container output",
+				Value: "auto",
+			},
+			&cli.StringFlag{
+				Name:  "tag",
+				Usage: "Name and optionally a tag in the 'name:tag' format",
+				Aliases: []string{"t"},
+			},
 		},
-		cli.StringFlag{
-			Name:  "progress",
-			Usage: "Set type of progress (auto, plain, tty). Use plain to show container output",
-			Value: "auto",
-		},
-		cli.StringFlag{
-			Name:  "tag, t",
-			Usage: "Name and optionally a tag in the 'name:tag' format",
-		},
-	})
-	app.Action = action
+		Action: action,
+	}
+
 	if err := app.Run(os.Args); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

@@ -34,7 +34,7 @@ func readManifest(ctx context.Context, c client.Client) (*Manifest, error) {
 		llb.WithCustomName("load manifest.yml"),
 	)
 
-	def, err := st.Marshal(llb.WithCaps(c.BuildOpts().LLBCaps))
+	def, err := st.Marshal(ctx, llb.WithCaps(c.BuildOpts().LLBCaps)) // Pass context here
 	if err != nil {
 		return nil, err
 	}

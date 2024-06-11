@@ -4,14 +4,17 @@ import (
 	"context"
 	"hash"
 	"io"
+	gofs "io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
+	"github.com/tonistiigi/fsutil/types"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -25,17 +28,18 @@ type DiskWriterOpt struct {
 	Filter        FilterFunc
 }
 
-type FilterFunc func(*Stat) bool
+type FilterFunc func(string, *types.Stat) bool
 
 type DiskWriter struct {
 	opt  DiskWriterOpt
 	dest string
 
-	wg     sync.WaitGroup
-	ctx    context.Context
-	cancel func()
-	eg     *errgroup.Group
-	filter FilterFunc
+	ctx         context.Context
+	cancel      func()
+	eg          *errgroup.Group
+	egCtx       context.Context
+	filter      FilterFunc
+	dirModTimes map[string]int64
 }
 
 func NewDiskWriter(ctx context.Context, dest string, opt DiskWriterOpt) (*DiskWriter, error) {
@@ -47,20 +51,36 @@ func NewDiskWriter(ctx context.Context, dest string, opt DiskWriterOpt) (*DiskWr
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	eg, ctx := errgroup.WithContext(ctx)
+	eg, egCtx := errgroup.WithContext(ctx)
 
 	return &DiskWriter{
-		opt:    opt,
-		dest:   dest,
-		eg:     eg,
-		ctx:    ctx,
-		cancel: cancel,
-		filter: opt.Filter,
+		opt:         opt,
+		dest:        dest,
+		eg:          eg,
+		ctx:         ctx,
+		egCtx:       egCtx,
+		cancel:      cancel,
+		filter:      opt.Filter,
+		dirModTimes: map[string]int64{},
 	}, nil
 }
 
 func (dw *DiskWriter) Wait(ctx context.Context) error {
-	return dw.eg.Wait()
+	if err := dw.eg.Wait(); err != nil {
+		return err
+	}
+	return filepath.WalkDir(dw.dest, func(path string, d gofs.DirEntry, prevErr error) error {
+		if prevErr != nil {
+			return prevErr
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if mtime, ok := dw.dirModTimes[path]; ok {
+			return chtimes(path, mtime)
+		}
+		return nil
+	})
 }
 
 func (dw *DiskWriter) HandleChange(kind ChangeKind, p string, fi os.FileInfo, err error) (retErr error) {
@@ -80,9 +100,15 @@ func (dw *DiskWriter) HandleChange(kind ChangeKind, p string, fi os.FileInfo, er
 		}
 	}()
 
-	destPath := filepath.Join(dw.dest, filepath.FromSlash(p))
+	destPath := filepath.Join(dw.dest, p)
 
 	if kind == ChangeKindDelete {
+		if dw.filter != nil {
+			var empty types.Stat
+			if ok := dw.filter(p, &empty); !ok {
+				return nil
+			}
+		}
 		// todo: no need to validate if diff is trusted but is it always?
 		if err := os.RemoveAll(destPath); err != nil {
 			return errors.Wrapf(err, "failed to remove: %s", destPath)
@@ -95,15 +121,15 @@ func (dw *DiskWriter) HandleChange(kind ChangeKind, p string, fi os.FileInfo, er
 		return nil
 	}
 
-	stat, ok := fi.Sys().(*Stat)
+	stat, ok := fi.Sys().(*types.Stat)
 	if !ok {
-		return errors.Errorf("%s invalid change without stat information", p)
+		return errors.WithStack(&os.PathError{Path: p, Err: syscall.EBADMSG, Op: "change without stat info"})
 	}
 
 	statCopy := *stat
 
 	if dw.filter != nil {
-		if ok := dw.filter(&statCopy); !ok {
+		if ok := dw.filter(p, &statCopy); !ok {
 			return nil
 		}
 	}
@@ -111,13 +137,13 @@ func (dw *DiskWriter) HandleChange(kind ChangeKind, p string, fi os.FileInfo, er
 	rename := true
 	oldFi, err := os.Lstat(destPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			if kind != ChangeKindAdd {
-				return errors.Wrapf(err, "invalid addition: %s", destPath)
+				return errors.Wrap(err, "modify/rm")
 			}
 			rename = false
 		} else {
-			return errors.Wrapf(err, "failed to stat %s", destPath)
+			return errors.WithStack(err)
 		}
 	}
 
@@ -138,8 +164,13 @@ func (dw *DiskWriter) HandleChange(kind ChangeKind, p string, fi os.FileInfo, er
 	switch {
 	case fi.IsDir():
 		if err := os.Mkdir(newPath, fi.Mode()); err != nil {
+			if errors.Is(err, syscall.EEXIST) {
+				// we saw a race to create this directory, so try again
+				return dw.HandleChange(kind, p, fi, nil)
+			}
 			return errors.Wrapf(err, "failed to create dir %s", newPath)
 		}
+		dw.dirModTimes[destPath] = statCopy.ModTime
 	case fi.Mode()&os.ModeDevice != 0 || fi.Mode()&os.ModeNamedPipe != 0:
 		if err := handleTarTypeBlockCharFifo(newPath, &statCopy); err != nil {
 			return errors.Wrapf(err, "failed to create device %s", newPath)
@@ -154,16 +185,15 @@ func (dw *DiskWriter) HandleChange(kind ChangeKind, p string, fi os.FileInfo, er
 		}
 	default:
 		isRegularFile = true
-		file, err := os.OpenFile(newPath, os.O_CREATE|os.O_WRONLY, fi.Mode()) //todo: windows
+		file, err := os.OpenFile(newPath, os.O_CREATE|os.O_WRONLY, fi.Mode())
 		if err != nil {
 			return errors.Wrapf(err, "failed to create %s", newPath)
 		}
 		if dw.opt.SyncDataCb != nil {
-			if err := dw.processChange(ChangeKindAdd, p, fi, file); err != nil {
+			if err := dw.processChange(dw.ctx, ChangeKindAdd, p, fi, file); err != nil {
 				file.Close()
 				return err
 			}
-			break
 		}
 		if err := file.Close(); err != nil {
 			return errors.Wrapf(err, "failed to close %s", newPath)
@@ -180,35 +210,36 @@ func (dw *DiskWriter) HandleChange(kind ChangeKind, p string, fi os.FileInfo, er
 				return errors.Wrapf(err, "failed to remove %s", destPath)
 			}
 		}
-		if err := os.Rename(newPath, destPath); err != nil {
+
+		if err := renameFile(newPath, destPath); err != nil {
 			return errors.Wrapf(err, "failed to rename %s to %s", newPath, destPath)
 		}
 	}
 
 	if isRegularFile {
 		if dw.opt.AsyncDataCb != nil {
-			dw.requestAsyncFileData(p, destPath, fi)
+			dw.requestAsyncFileData(p, destPath, fi, &statCopy)
 		}
 	} else {
-		return dw.processChange(kind, p, fi, nil)
+		return dw.processChange(dw.ctx, kind, p, fi, nil)
 	}
 
 	return nil
 }
 
-func (dw *DiskWriter) requestAsyncFileData(p, dest string, fi os.FileInfo) {
+func (dw *DiskWriter) requestAsyncFileData(p, dest string, fi os.FileInfo, st *types.Stat) {
 	// todo: limit worker threads
 	dw.eg.Go(func() error {
-		if err := dw.processChange(ChangeKindAdd, p, fi, &lazyFileWriter{
+		if err := dw.processChange(dw.egCtx, ChangeKindAdd, p, fi, &lazyFileWriter{
 			dest: dest,
 		}); err != nil {
 			return err
 		}
-		return chtimes(dest, fi.ModTime().UnixNano()) // TODO: parent dirs
+		return chtimes(dest, st.ModTime) // TODO: parent dirs
 	})
 }
 
-func (dw *DiskWriter) processChange(kind ChangeKind, p string, fi os.FileInfo, w io.WriteCloser) error {
+func (dw *DiskWriter) processChange(ctx context.Context, kind ChangeKind, p string, fi os.FileInfo, w io.WriteCloser) error {
 	origw := w
 	var hw *hashedWriter
 	if dw.opt.NotifyCb != nil {
@@ -223,7 +254,7 @@ func (dw *DiskWriter) processChange(kind ChangeKind, p string, fi os.FileInfo, w
 		if fn == nil && dw.opt.AsyncDataCb != nil {
 			fn = dw.opt.AsyncDataCb
 		}
-		if err := fn(dw.ctx, p, w); err != nil {
+		if err := fn(ctx, p, w); err != nil {
 			return err
 		}
 	} else {
@@ -246,7 +277,7 @@ type hashedWriter struct {
 }
 
 func newHashWriter(ch ContentHasher, fi os.FileInfo, w io.WriteCloser) (*hashedWriter, error) {
-	stat, ok := fi.Sys().(*Stat)
+	stat, ok := fi.Sys().(*types.Stat)
 	if !ok {
 		return nil, errors.Errorf("invalid change without stat information")
 	}
@@ -278,14 +309,13 @@ func (hw *hashedWriter) Digest() digest.Digest {
 
 type lazyFileWriter struct {
 	dest     string
-	ctx      context.Context
 	f        *os.File
 	fileMode *os.FileMode
 }
 
 func (lfw *lazyFileWriter) Write(dt []byte) (int, error) {
 	if lfw.f == nil {
-		file, err := os.OpenFile(lfw.dest, os.O_WRONLY, 0) //todo: windows
+		file, err := os.OpenFile(lfw.dest, os.O_WRONLY, 0)
 		if os.IsPermission(err) {
 			// retry after chmod
 			fi, er := os.Stat(lfw.dest)
@@ -315,10 +345,6 @@ func (lfw *lazyFileWriter) Close() error {
 		err = os.Chmod(lfw.dest, *lfw.fileMode)
 	}
 	return err
-}
-
-func mkdev(major int64, minor int64) uint32 {
-	return uint32(((minor & 0xfff00) << 12) | ((major & 0xfff) << 8) | (minor & 0xff))
 }
 
 // Random number state.

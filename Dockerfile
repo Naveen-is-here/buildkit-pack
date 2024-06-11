@@ -3,6 +3,10 @@
 FROM golang:1.11-alpine AS build
 WORKDIR /go/src/github.com/tonistiigi/buildkit-pack
 RUN apk add --no-cache file
+
+# Copy the vendor directory
+COPY vendor ./vendor
+
 RUN --mount=target=. --mount=target=/root/.cache,type=cache \
   CGO_ENABLED=0 go build -o /out/pack ./cmd/pack && file /out/pack | grep "statically linked"
   

@@ -1,10 +1,26 @@
+//go:build linux || darwin
 // +build linux darwin
+
+/*
+   Copyright The containerd Authors.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
 
 package sysx
 
 import (
 	"bytes"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -50,60 +66,53 @@ func LGetxattr(path, attr string) ([]byte, error) {
 	return getxattrAll(path, attr, unix.Lgetxattr)
 }
 
-const defaultXattrBufferSize = 5
+const defaultXattrBufferSize = 128
 
 type listxattrFunc func(path string, dest []byte) (int, error)
 
 func listxattrAll(path string, listFunc listxattrFunc) ([]string, error) {
-	var p []byte // nil on first execution
-
-	for {
-		n, err := listFunc(path, p) // first call gets buffer size.
+	buf := make([]byte, defaultXattrBufferSize)
+	n, err := listFunc(path, buf)
+	for err == unix.ERANGE {
+		// Buffer too small, use zero-sized buffer to get the actual size
+		n, err = listFunc(path, []byte{})
 		if err != nil {
 			return nil, err
 		}
-
-		if n > len(p) {
-			p = make([]byte, n)
-			continue
-		}
-
-		p = p[:n]
-
-		ps := bytes.Split(bytes.TrimSuffix(p, []byte{0}), []byte{0})
-		var entries []string
-		for _, p := range ps {
-			s := string(p)
-			if s != "" {
-				entries = append(entries, s)
-			}
-		}
-
-		return entries, nil
+		buf = make([]byte, n)
+		n, err = listFunc(path, buf)
 	}
+	if err != nil {
+		return nil, err
+	}
+
+	ps := bytes.Split(bytes.TrimSuffix(buf[:n], []byte{0}), []byte{0})
+	var entries []string
+	for _, p := range ps {
+		if len(p) > 0 {
+			entries = append(entries, string(p))
+		}
+	}
+
+	return entries, nil
 }
 
 type getxattrFunc func(string, string, []byte) (int, error)
 
 func getxattrAll(path, attr string, getFunc getxattrFunc) ([]byte, error) {
-	p := make([]byte, defaultXattrBufferSize)
-	for {
-		n, err := getFunc(path, attr, p)
+	buf := make([]byte, defaultXattrBufferSize)
+	n, err := getFunc(path, attr, buf)
+	for err == unix.ERANGE {
+		// Buffer too small, use zero-sized buffer to get the actual size
+		n, err = getFunc(path, attr, []byte{})
 		if err != nil {
-			if errno, ok := err.(syscall.Errno); ok && errno == syscall.ERANGE {
-				p = make([]byte, len(p)*2) // this can't be ideal.
-				continue                   // try again!
-			}
-
 			return nil, err
 		}
-
-		// realloc to correct size and repeat
-		if n > len(p) {
-			p = make([]byte, n)
-			continue
-		}
-
-		return p[:n], nil
+		buf = make([]byte, n)
+		n, err = getFunc(path, attr, buf)
 	}
+	if err != nil {
+		return nil, err
+	}
+	return buf[:n], nil
 }
